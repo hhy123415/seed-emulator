@@ -5,6 +5,9 @@ from typing import List, Dict, Tuple, Set, Optional
 from re import sub
 from random import randint
 import requests
+import base64
+import secrets
+import re
 
 DomainNameServiceFileTemplates: Dict[str, str] = {}
 ROOT_ZONE_URL = 'https://www.internic.net/domain/root.zone'
@@ -510,8 +513,131 @@ class DomainNameService(Service):
         self.__autoNs = autoNameServer
         self.__rootZone = Zone('.')
         self.__masters = {}
+        self.__registryAuthorizations = []
         self.addDependency('Base', False, False)
     
+    def authorizeRegistry(self, registry, zones):
+        """授权 Registry 更新指定 TLD；元组依次为主、可选从 DNS 虚拟节点。
+
+        Authorize a Registry publisher for TLDs mapped to primary and optional
+        secondary DNS virtual nodes. The publisher must provide getTlds() and
+        setDnsAuthorization(tld, address, key). Call before rendering. Keys are
+        generated during rendering; deploy the publisher and DNS nodes together.
+        """
+        if not isinstance(zones, dict) or not zones:
+            raise ValueError('zones must be a non-empty TLD-to-DNS-node mapping')
+        managed = set(registry.getTlds())
+        normalized, servers, hosted = {}, {}, {}
+        for value, names in zones.items():
+            if not isinstance(value, str):
+                raise ValueError('TLD must be a string')
+            tld = value.removeprefix('.').lower()
+            if not re.fullmatch(r'[a-z](?:[a-z0-9-]{0,29}[a-z0-9])?', tld):
+                raise ValueError(f'Invalid TLD: {value}')
+            if tld in normalized or tld not in managed:
+                raise ValueError(f'Duplicate or unmanaged DNS TLD: {value}')
+            if (not isinstance(names, (tuple, list)) or not 1 <= len(names) <= 2
+                    or any(not isinstance(name, str) or not name for name in names)
+                    or len(set(names)) != len(names)):
+                raise ValueError(f'{value} requires one primary and optionally a distinct secondary virtual node')
+            normalized[tld] = tuple(names)
+            for name in names:
+                server = self._pending_targets.get(name)
+                if server is None:
+                    raise ValueError(f'Unknown DNS virtual node: {name}')
+                if tld + '.' not in server.getZones():
+                    raise ValueError(f'{name} does not host {tld}.')
+                if server.getIncludePath(tld + '.') is not None:
+                    raise ValueError(f'{name} already has a custom include for {tld}.')
+                servers[name] = server
+                hosted.setdefault(name, set()).add(tld + '.')
+        for name, server in servers.items():
+            if set(server.getZones()) != hosted[name]:
+                raise ValueError(f'All zones hosted by {name} must be included in zones')
+        # 完整校验后才修改 include。 / Mutate includes only after complete validation.
+        for tld, names in normalized.items():
+            for name in names:
+                servers[name].setInclude(tld + '.', f'/etc/bind/registry-{tld}.conf')
+        self.__registryAuthorizations.append((registry, normalized))
+        return self
+
+    def __renderRegistryAuthorizations(self, emulator):
+        """渲染 DNS 授权，并将共享密钥交给发布端。 / Render DNS authorization and pass shared keys to publishers."""
+        def new_key(identity):
+            secret = base64.b64encode(secrets.token_bytes(32)).decode('ascii')
+            return f'key "{identity}" {{ algorithm hmac-sha256; secret "{secret}"; }};\n'
+
+        for registry, zones in self.__registryAuthorizations:
+            if set(zones) - set(registry.getTlds()):
+                raise ValueError('Authorized TLDs must remain managed by Registry')
+            for tld, vnodes in zones.items():
+                zone = tld + '.'
+                nodes = [emulator.getServerByVirtualNodeName(name).getNode() for name in vnodes]
+                primary = nodes[0]
+                primary_ip = str(primary.getInterfaces()[0].getAddress())
+                publish_id, transfer_id = f'registry-{tld}-publisher', f'{tld}-zone-transfer'
+                bind_path = f'/etc/bind/keys/{tld}-publisher.key'
+                transfer_path = f'/etc/bind/keys/{tld}-transfer.key'
+                zone_path = f'/etc/bind/zones/{zone}'
+                config_path = f'/etc/bind/registry-{tld}.conf'
+                publish_key, transfer_key = new_key(publish_id), new_key(transfer_id)
+                records = self.getZone(zone).getRecords()
+
+                # 保护区域顶点和名称服务器记录，兼容显式 TTL 和 IN 类字段。
+                # Protect the apex and name server records, including explicit TTL and IN fields.
+                protected = {zone}
+                for record in records:
+                    fields = record.split(';', 1)[0].split()
+                    upper = [field.upper() for field in fields]
+                    if fields and fields[0].lower() in ('@', zone) and 'NS' in upper:
+                        index = upper.index('NS')
+                        if index + 1 < len(fields):
+                            name = fields[index + 1].lower()
+                            protected.add(name if name.endswith('.') else name + '.' + zone)
+                policy = '\n'.join(f'    deny {publish_id} name {name} ANY;' for name in sorted(protected))
+                policy += f'\n    grant {publish_id} subdomain {zone} NS A AAAA;'
+                transfer = '    allow-transfer { none; };\n    notify no;'
+                if len(nodes) == 2:
+                    secondary_ip = str(nodes[1].getInterfaces()[0].getAddress())
+                    transfer = (f'    allow-transfer {{ key "{transfer_id}"; }};\n'
+                                '    notify explicit;\n'
+                                f'    also-notify {{ {secondary_ip} key "{transfer_id}"; }};')
+                primary.setFile(config_path, f'''include "{bind_path}";
+include "{transfer_path}";
+zone "{zone}" {{
+    type master;
+    file "{zone_path}";
+    update-policy {{
+{policy}
+    }};
+{transfer}
+}};
+''')
+                if len(nodes) == 2:
+                    nodes[1].setFile(config_path, f'''include "{transfer_path}";
+zone "{zone}" {{
+    type slave;
+    file "{zone_path}";
+    masters {{ {primary_ip} key "{transfer_id}"; }};
+    allow-notify {{ key "{transfer_id}"; }};
+    allow-transfer {{ none; }};
+    allow-update-forwarding {{ none; }};
+}};
+''')
+                primary.setFile(bind_path, publish_key)
+                for node in nodes:
+                    # 自定义 include 会跳过默认区域文件生成，因此显式补写。
+                    # Custom includes skip default zone files, so write them explicitly.
+                    node.setFile(zone_path, '\n'.join(records) + '\n')
+                    options = node.getFile('/etc/bind/named.conf.options')
+                    options.setContent(options.get()[1].replace('allow-update { any; };', 'allow-update { none; };'))
+                    node.setFile(transfer_path, transfer_key)
+                    permissions = ('chown -R root:bind /etc/bind/keys && '
+                                   'chmod 750 /etc/bind/keys && chmod 640 /etc/bind/keys/*.key')
+                    node.addBuildCommandAtEnd(permissions)
+                    node.insertStartCommand(0, permissions)
+                registry.setDnsAuthorization(tld, primary_ip, publish_key)
+
     def __autoNameServer(self, zone: Zone):
         """!
         @brief Try to automatically add NS records of children to parent zones.
@@ -642,6 +768,7 @@ class DomainNameService(Service):
             self.__autoNameServer(self.__rootZone)
 
         super().render(emulator)
+        self.__renderRegistryAuthorizations(emulator)
 
     def print(self, indent: int) -> str:
         out = ' ' * indent
